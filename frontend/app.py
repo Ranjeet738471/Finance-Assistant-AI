@@ -1,5 +1,5 @@
 """Gradio-based chat UI for the Finance Assistant.
-Replaces Streamlit with a more responsive interface and auto-generated API.
+  Gradio is more responsive interface and auto-generated API.
 
 Optimized version with:
 - Better error handling

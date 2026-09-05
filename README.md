@@ -127,12 +127,19 @@ activation scripts:
 # Backend only
 powershell -ExecutionPolicy Bypass -File .\scripts\run.ps1 -Target backend
 
+# Local Qwen model only
+powershell -ExecutionPolicy Bypass -File .\scripts\run.ps1 -Target model
+
 # Frontend only (requires the backend to already be running)
 powershell -ExecutionPolicy Bypass -File .\scripts\run.ps1 -Target frontend
 
 # Start both; closing the frontend stops the backend
 powershell -ExecutionPolicy Bypass -File .\scripts\run.ps1 -Target all
 ```
+
+The `all` target starts the local Qwen model on port `8080`, the backend on
+port `8000`, and the Gradio frontend on port `8502`. If the model is already
+running, it reuses the existing process.
 
 The equivalent direct commands are:
 

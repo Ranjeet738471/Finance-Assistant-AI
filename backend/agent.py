@@ -61,6 +61,11 @@ Rules (grounding is critical - a wrong number is a serious liability):
 11. The database dialect is {db_backend}. For MySQL, use MySQL syntax such as
      DATE_FORMAT and YEAR/MONTH; never use SQLite functions such as strftime.
      For SQLite, use SQLite-compatible date functions.
+12. Answer only questions about the connected finance data. For unrelated
+    questions, say: "Please ask a question related to the finance data."
+13. Account numbers are sensitive. You may answer account-related finance
+    questions, but never reveal a full account number; show only a masked
+    value such as ************5317.
 """
 
 
@@ -113,13 +118,60 @@ def _fallback_answer(result: dict) -> str | None:
     return "Here are the results from the database:\n\n" + "\n".join([header, divider, *body])
 
 
+def _mask_account_number(value: object) -> str:
+    """Keep only the last four characters of a sensitive account number."""
+    value_text = str(value)
+    if len(value_text) <= 4:
+        return "****"
+    return "*" * (len(value_text) - 4) + value_text[-4:]
+
+
+def _protect_account_numbers(answer: str, rows: list[dict]) -> tuple[str, list[dict]]:
+    """Mask account_number values in both model text and API table output."""
+    protected_rows = []
+    replacements: dict[str, str] = {}
+    for row in rows:
+        protected = dict(row)
+        if "account_number" in protected and protected["account_number"] is not None:
+            raw = str(protected["account_number"])
+            masked = _mask_account_number(raw)
+            protected["account_number"] = masked
+            replacements[raw] = masked
+        protected_rows.append(protected)
+
+    protected_answer = answer
+    for raw, masked in replacements.items():
+        protected_answer = protected_answer.replace(raw, masked)
+    return protected_answer, protected_rows
+
+
+_OUT_OF_SCOPE_PATTERNS = re.compile(
+    r"\b(weather|forecast|joke|recipe|cook|sports?|football|cricket|movie|"
+    r"politics?|news|write code|python code|programming|song|poem|story)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_obviously_out_of_scope(question: str) -> bool:
+    """Reject clearly unrelated requests before sending them to the model."""
+    return bool(_OUT_OF_SCOPE_PATTERNS.search(question))
+
+
 def _common_join_sql(question: str, tenant_id: str) -> str | None:
     """Return stable SQL for the three common cross-table finance questions."""
     schema = get_schema_map(tenant_id)
     if not {"account", "bank", "transaction"}.issubset(schema):
         return None
 
-    text = question.lower()
+    text = " ".join(question.lower().split())
+    if "hdfc" in text and "account number" in text:
+        return """SELECT a.account_number
+FROM account a
+JOIN bank b ON a.bank_code = b.bank_code
+WHERE b.bank_name LIKE '%HDFC%'
+ORDER BY a.account_number
+LIMIT 5"""
+
     if ("total transaction amount" in text and "transaction count" in text
             and "each bank" in text):
         return """SELECT b.bank_name,
@@ -165,6 +217,53 @@ LEFT JOIN transaction t ON t.account_id = a.account_id
 GROUP BY b.bank_code, b.bank_name
 ORDER BY total_transaction_amount DESC"""
 
+    if ("debit" in text and "credit" in text and "each bank" in text):
+        return """SELECT b.bank_name,
+    SUM(CASE WHEN t.transaction_type = 'debit' THEN t.transaction_amount ELSE 0 END) AS total_debit_amount,
+    SUM(CASE WHEN t.transaction_type = 'credit' THEN t.transaction_amount ELSE 0 END) AS total_credit_amount
+FROM transaction t
+JOIN account a ON t.account_id = a.account_id
+JOIN bank b ON a.bank_code = b.bank_code
+GROUP BY b.bank_code, b.bank_name
+ORDER BY b.bank_name"""
+
+    if ("highest" in text or "maximum" in text or "max" in text) and "balance" in text:
+        return """SELECT b.bank_name,
+    MAX(a.available_balance) AS highest_available_balance
+FROM bank b
+JOIN account a ON a.bank_code = b.bank_code
+GROUP BY b.bank_code, b.bank_name
+ORDER BY highest_available_balance DESC"""
+
+    if "average transaction" in text and "bank" in text:
+        return """SELECT b.bank_name,
+    AVG(t.transaction_amount) AS average_transaction_amount
+FROM transaction t
+JOIN account a ON t.account_id = a.account_id
+JOIN bank b ON a.bank_code = b.bank_code
+GROUP BY b.bank_code, b.bank_name
+ORDER BY average_transaction_amount DESC"""
+
+    if ("latest transaction" in text or "most recent transaction" in text) and "bank" in text:
+        return """SELECT b.bank_name,
+    MAX(t.transaction_date) AS latest_transaction_date
+FROM transaction t
+JOIN account a ON t.account_id = a.account_id
+JOIN bank b ON a.bank_code = b.bank_code
+GROUP BY b.bank_code, b.bank_name
+ORDER BY latest_transaction_date DESC"""
+
+    if ("transaction type" in text or "transaction types" in text) and "bank" in text:
+        return """SELECT b.bank_name,
+    t.transaction_type,
+    COUNT(t.transaction_id) AS transaction_count,
+    SUM(t.transaction_amount) AS total_transaction_amount
+FROM transaction t
+JOIN account a ON t.account_id = a.account_id
+JOIN bank b ON a.bank_code = b.bank_code
+GROUP BY b.bank_code, b.bank_name, t.transaction_type
+ORDER BY b.bank_name, t.transaction_type"""
+
     return None
 
 
@@ -181,6 +280,18 @@ def run_agent(
         span.set_attribute("question", question)
         span.set_attribute("llm_provider", llm_provider or "default")
 
+        if _is_obviously_out_of_scope(question):
+            answer = "Please ask a question related to the finance data."
+            span.set_attribute("status", "out_of_scope")
+            return {
+                "answer": answer,
+                "sql": None,
+                "table": [],
+                "confidence": None,
+                "anomalies": [],
+                "status": "out_of_scope",
+            }
+
         tools = build_tools(tenant_id)
         tools_by_name = {t.name: t for t in tools}
 
@@ -190,12 +301,15 @@ def run_agent(
             result = json.loads(output)
             fallback = _fallback_answer(result)
             if fallback:
+                protected_answer, protected_rows = _protect_account_numbers(
+                    fallback, result.get("rows", [])
+                )
                 span.set_attribute("status", "ok")
                 log.info("agent_common_join tenant_id=%s sql=%r", tenant_id, common_sql)
                 return {
-                    "answer": fallback,
+                    "answer": protected_answer,
                     "sql": common_sql,
-                    "table": result.get("rows", []),
+                    "table": protected_rows,
                     "confidence": result.get("confidence"),
                     "anomalies": result.get("anomalies", []),
                     "status": "ok",
@@ -236,12 +350,15 @@ def run_agent(
                     )
                     fallback = _fallback_answer(last_result)
                     if fallback:
+                        protected_answer, protected_rows = _protect_account_numbers(
+                            fallback, last_result.get("rows", [])
+                        )
                         span.set_attribute("status", "ok")
                         log.info("agent_fallback_answer tenant_id=%s sql=%r", tenant_id, last_sql)
                         return {
-                            "answer": fallback,
+                            "answer": protected_answer,
                             "sql": last_sql,
-                            "table": last_result.get("rows", []),
+                            "table": protected_rows,
                             "confidence": last_result.get("confidence"),
                             "anomalies": last_result.get("anomalies", []),
                             "status": "ok",
@@ -265,10 +382,13 @@ def run_agent(
                     status = "no_data"
                 span.set_attribute("status", status)
                 log.info("agent_final_answer tenant_id=%s status=%s sql=%r", tenant_id, status, last_sql)
+                protected_answer, protected_rows = _protect_account_numbers(
+                    ai_msg.content, last_result.get("rows", [])
+                )
                 return {
-                    "answer": ai_msg.content,
+                    "answer": protected_answer,
                     "sql": last_sql,
-                    "table": last_result.get("rows", []),
+                    "table": protected_rows,
                     "confidence": last_result.get("confidence"),
                     "anomalies": last_result.get("anomalies", []),
                     "status": status,
@@ -297,12 +417,15 @@ def run_agent(
 
         fallback = _fallback_answer(last_result)
         if fallback:
+            protected_answer, protected_rows = _protect_account_numbers(
+                fallback, last_result.get("rows", [])
+            )
             span.set_attribute("status", "ok")
             log.info("agent_fallback_answer tenant_id=%s sql=%r", tenant_id, last_sql)
             return {
-                "answer": fallback,
+                "answer": protected_answer,
                 "sql": last_sql,
-                "table": last_result.get("rows", []),
+                "table": protected_rows,
                 "confidence": last_result.get("confidence"),
                 "anomalies": last_result.get("anomalies", []),
                 "status": "ok",

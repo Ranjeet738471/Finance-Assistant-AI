@@ -14,6 +14,7 @@ import pandas as pd
 from sqlalchemy import create_engine, inspect
 
 from backend.config import (
+    DB_BACKEND,
     DEFAULT_TENANT,
     SUPPORTED_EXTENSIONS,
     tenant_data_dir,
@@ -131,6 +132,9 @@ def build_database(tenant_id: str = DEFAULT_TENANT, force: bool = False) -> dict
     """Rebuild a tenant's SQLite database from whatever CSV/Excel files are
     currently in that tenant's data directory. The old database file is
     dropped first so no stale data lingers after the source files change."""
+    if DB_BACKEND == "mysql":
+        return {"rebuilt": False, "tenant_id": tenant_id, "backend": "mysql"}
+
     if not force and not needs_rebuild(tenant_id):
         return {"rebuilt": False, "tenant_id": tenant_id, "tables": list_tables(tenant_id)}
 

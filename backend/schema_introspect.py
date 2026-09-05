@@ -4,6 +4,7 @@ generated SQL against a whitelist of real tables/columns. All functions are
 tenant-scoped - each tenant has its own SQLite file and its own cached
 engine, so data/schema never leaks across tenants."""
 import threading
+from urllib.parse import quote_plus
 
 import sqlglot
 from sqlglot import exp
@@ -11,7 +12,17 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import QueuePool
 
-from backend.config import DEFAULT_TENANT, tenant_db_path
+from backend.config import (
+    DB_BACKEND,
+    DEFAULT_TENANT,
+    MYSQL_DB,
+    MYSQL_HOST,
+    MYSQL_PASSWORD,
+    MYSQL_PORT,
+    MYSQL_SSL_CA,
+    MYSQL_USER,
+    tenant_db_path,
+)
 from backend.logging_config import get_logger
 
 log = get_logger(__name__)
@@ -31,28 +42,39 @@ def get_engine(tenant_id: str = DEFAULT_TENANT) -> Engine:
     with _engine_lock:
         engine = _engine_cache.get(tenant_id)
         if engine is None:
-            db_path = tenant_db_path(tenant_id)
-            engine = create_engine(
-                f"sqlite:///{db_path}",
-                poolclass=QueuePool,
-                pool_size=POOL_SIZE,
-                max_overflow=MAX_OVERFLOW,
-                pool_timeout=POOL_TIMEOUT,
-                pool_recycle=POOL_RECYCLE,
-                # SQLite-specific optimizations
-                connect_args={
-                    "check_same_thread": False,  # Allow multithreaded access with pool
-                },
-                # Enable WAL mode for better concurrency
-                execution_options={
-                    "sqlite_pragma": [
-                        ("journal_mode", "wal"),
-                        ("synchronous", "normal"),
-                        ("cache_size", "10000"),
-                        ("temp_store", "memory"),
-                    ]
-                }
-            )
+            if DB_BACKEND == "mysql":
+                user = quote_plus(MYSQL_USER)
+                password = quote_plus(MYSQL_PASSWORD)
+                url = f"mysql+pymysql://{user}:{password}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}"
+                connect_args = {"ssl": {"ca": MYSQL_SSL_CA}} if MYSQL_SSL_CA else {}
+                engine = create_engine(
+                    url,
+                    poolclass=QueuePool,
+                    pool_size=POOL_SIZE,
+                    max_overflow=MAX_OVERFLOW,
+                    pool_timeout=POOL_TIMEOUT,
+                    pool_recycle=POOL_RECYCLE,
+                    connect_args=connect_args,
+                )
+            else:
+                db_path = tenant_db_path(tenant_id)
+                engine = create_engine(
+                    f"sqlite:///{db_path}",
+                    poolclass=QueuePool,
+                    pool_size=POOL_SIZE,
+                    max_overflow=MAX_OVERFLOW,
+                    pool_timeout=POOL_TIMEOUT,
+                    pool_recycle=POOL_RECYCLE,
+                    connect_args={"check_same_thread": False},
+                    execution_options={
+                        "sqlite_pragma": [
+                            ("journal_mode", "wal"),
+                            ("synchronous", "normal"),
+                            ("cache_size", "10000"),
+                            ("temp_store", "memory"),
+                        ]
+                    }
+                )
             _engine_cache[tenant_id] = engine
             log.info("engine_created tenant_id=%s pool_size=%d", tenant_id, POOL_SIZE)
         return engine
@@ -93,8 +115,9 @@ def get_schema_prompt(tenant_id: str = DEFAULT_TENANT, sample_rows: int = 2) -> 
         for table, columns in schema.items():
             lines.append(f"TABLE {table}({', '.join(columns)})")
             try:
+                quoted_table = engine.dialect.identifier_preparer.quote(table)
                 rows = conn.execute(
-                    text(f'SELECT * FROM "{table}" LIMIT :n'), {"n": sample_rows}
+                    text(f"SELECT * FROM {quoted_table} LIMIT :n"), {"n": sample_rows}
                 ).fetchall()
                 for row in rows:
                     lines.append(f"  sample: {dict(zip(columns, row))}")
@@ -116,7 +139,7 @@ def is_query_safe(sql: str, tenant_id: str = DEFAULT_TENANT) -> tuple[bool, str]
     the tree - including inside subqueries and CTEs - which a naive keyword
     blacklist can miss."""
     try:
-        statements = [s for s in sqlglot.parse(sql, read="sqlite") if s is not None]
+        statements = [s for s in sqlglot.parse(sql, read=DB_BACKEND) if s is not None]
     except Exception as exc:  # noqa: BLE001
         return False, f"Query could not be parsed: {exc}"
 

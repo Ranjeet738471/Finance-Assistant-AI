@@ -78,6 +78,18 @@ def _contains_number(text: str) -> bool:
     return bool(re.search(r"\d", text or ""))
 
 
+def _numbers_in_text(text: str) -> set[str]:
+    """Return normalized numeric tokens, ignoring thousands separators."""
+    return {token.replace(",", "") for token in re.findall(r"\d[\d,]*(?:\.\d+)?", text or "")}
+
+
+def _answer_is_grounded(answer: str, result: dict, seen_numbers: set[str]) -> bool:
+    """Ensure every numeric claim appears in a SQL result from this turn."""
+    answer_numbers = _numbers_in_text(answer)
+    result_numbers = _numbers_in_text(json.dumps(result, default=str))
+    return answer_numbers.issubset(result_numbers | seen_numbers)
+
+
 def run_agent(
     question: str,
     history: list[dict] | None = None,
@@ -103,6 +115,7 @@ def run_agent(
 
         last_sql: str | None = None
         last_result: dict = {}
+        seen_result_numbers: set[str] = set()
 
         for step in range(MAX_STEPS):
             with tracer.start_as_current_span("agent.llm_invoke") as step_span:
@@ -116,21 +129,23 @@ def run_agent(
                 # means the figures were not computed from the database - they
                 # were fabricated (often from conversation history). Reject it
                 # and force the model to actually query the data.
-                if last_sql is None and _contains_number(ai_msg.content):
+                if _contains_number(ai_msg.content) and (
+                    last_sql is None
+                    or not _answer_is_grounded(ai_msg.content, last_result, seen_result_numbers)
+                ):
                     log.warning(
                         "agent_grounding_guard tenant_id=%s: final answer contains "
-                        "numbers but no run_sql was executed; rejecting and nudging.",
+                        "numbers not present in the latest run_sql result; rejecting and nudging.",
                         tenant_id,
                     )
                     messages.append(
                         HumanMessage(
                             content=(
-                                "Your previous answer stated numbers, but you did not "
-                                "call run_sql this turn, so those figures are not "
-                                "grounded in the database. Do not answer from memory "
-                                "or from the conversation history. Call run_sql to "
-                                "compute the requested values, then answer using only "
-                                "that result."
+                                "Your previous answer included numbers that were not "
+                                "all present in the latest run_sql result. Do not answer "
+                                "from memory or conversation history. Call run_sql for "
+                                "every value requested, then answer using only those "
+                                "returned results."
                             )
                         )
                     )
@@ -164,6 +179,9 @@ def run_agent(
                             tool_span.set_attribute("sql", last_sql or "")
                             try:
                                 last_result = json.loads(output)
+                                seen_result_numbers.update(
+                                    _numbers_in_text(json.dumps(last_result, default=str))
+                                )
                             except json.JSONDecodeError:
                                 last_result = {}
                 messages.append(ToolMessage(content=output, tool_call_id=call["id"]))

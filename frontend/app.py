@@ -332,17 +332,6 @@ def create_ui():
                 Ask questions about your financial data in plain English
                 """, elem_id="app-header")
 
-                # Data upload - replaces all existing data on the backend
-                with gr.Group():
-                    gr.Markdown("### 📁 Upload Data")
-                    file_upload = gr.File(
-                        label="CSV / Excel file(s)",
-                        file_count="multiple",
-                        file_types=[".csv", ".xlsx", ".xls"],
-                    )
-                    upload_btn = gr.Button("Upload & Replace Data", size="sm", variant="primary")
-                    upload_status = gr.Markdown("")
-
                 # LLM Provider selection
                 with gr.Group():
                     model_dropdown = gr.Dropdown(
@@ -409,13 +398,6 @@ def create_ui():
             outputs=[msg_input],
         )
         
-        # Data upload handler
-        upload_btn.click(
-            fn=upload_data,
-            inputs=[file_upload],
-            outputs=[upload_status],
-        )
-
         # Action handlers
         clear_btn.click(
             fn=clear_conversation,

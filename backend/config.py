@@ -15,6 +15,16 @@ DATA_ROOT = Path(os.environ.get("FIN_DATA_DIR", BASE_DIR / "data"))
 DB_ROOT = Path(os.environ.get("FIN_DB_DIR", BASE_DIR / "db"))
 DEFAULT_TENANT = "default"
 
+# Finance database backend. SQLite remains the default for local CSV uploads;
+# set DB_BACKEND=mysql to query an existing MySQL database directly.
+DB_BACKEND = os.environ.get("FIN_DB_BACKEND", "sqlite").lower()
+MYSQL_HOST = os.environ.get("MYSQL_HOST", "127.0.0.1")
+MYSQL_PORT = int(os.environ.get("MYSQL_PORT", "3306"))
+MYSQL_USER = os.environ.get("MYSQL_USER", "root")
+MYSQL_PASSWORD = os.environ.get("MYSQL_PASSWORD", "")
+MYSQL_DB = os.environ.get("MYSQL_DB", "finance_db")
+MYSQL_SSL_CA = os.environ.get("MYSQL_SSL_CA", "")
+
 DATA_ROOT.mkdir(parents=True, exist_ok=True)
 DB_ROOT.mkdir(parents=True, exist_ok=True)
 

@@ -11,7 +11,7 @@ Optimizations:
 import pandas as pd
 from sqlalchemy import text
 
-from backend.config import DEFAULT_TENANT
+from backend.config import DB_BACKEND, DEFAULT_TENANT
 from backend.logging_config import get_logger
 from backend.query_cache import get_query_cache
 from backend.schema_introspect import get_engine, is_query_safe
@@ -69,8 +69,8 @@ def run_query(
     engine = get_engine(tenant_id)
     try:
         with engine.connect() as conn:
-            # Set query timeout (SQLite pragma)
-            conn.execute(text("PRAGMA busy_timeout = 30000"))  # 30 seconds
+            if DB_BACKEND == "sqlite":
+                conn.execute(text("PRAGMA busy_timeout = 30000"))
             
             df = pd.read_sql(text(paginated_sql), conn)
             

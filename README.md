@@ -83,6 +83,24 @@ FIN_LLM_TEMPERATURE=0.2
 `.env` is gitignored so it's never committed; edit it directly to point at a
 different model/endpoint.
 
+### MySQL database
+
+To query an existing MySQL database instead of rebuilding a local SQLite
+database from uploaded files, add these values to `.env`:
+
+```dotenv
+FIN_DB_BACKEND=mysql
+MYSQL_HOST=10.20.16.189
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=your-password
+MYSQL_DB=finance_db
+MYSQL_SSL_CA=
+```
+
+The phpMyAdmin URL is only the database administration web interface. The
+application connects directly to MySQL on port `3306`.
+
 **Tool calling requirement:** the agent relies on OpenAI-style tool/function
 calling. If serving Qwen via vLLM, start it with tool-calling enabled, e.g.
 `--enable-auto-tool-choice --tool-call-parser hermes` (or the Qwen-specific
@@ -213,5 +231,6 @@ The following were explicitly marked "Out of Scope" for the hackathon:
   of a fabricated answer.
 - The agent is capped at 5 tool-call steps per question (`MAX_STEPS` in
   `backend/agent.py`) to prevent runaway loops.
-#   F i n a n c e - A s s i s t a n t - A I  
+#   F i n a n c e - A s s i s t a n t - A I 
+ 
  

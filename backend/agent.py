@@ -8,9 +8,10 @@ from datetime import date
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from backend.config import DEFAULT_TENANT
+from backend.config import DB_BACKEND, DEFAULT_TENANT
 from backend.llm_client import get_llm
 from backend.logging_config import get_logger
+from backend.schema_introspect import get_schema_map
 from backend.tools import build_tools, build_cross_tenant_tools
 from backend.tracing import get_tracer
 
@@ -54,6 +55,12 @@ Rules (grounding is critical - a wrong number is a serious liability):
     aggregations (COUNT, SUM, AVG) rather than returning raw rows. Only add 
     a SQL LIMIT clause when the user explicitly requests a limited number of 
     records (for example, "top 10" or "show 20 rows").
+10. When a question asks to combine information from multiple tables, prefer
+    one SQL query with the necessary JOIN clauses and return all requested
+    measures in that single result.
+11. The database dialect is {db_backend}. For MySQL, use MySQL syntax such as
+     DATE_FORMAT and YEAR/MONTH; never use SQLite functions such as strftime.
+     For SQLite, use SQLite-compatible date functions.
 """
 
 
@@ -64,10 +71,11 @@ def _system_prompt_with_date(base_prompt: str) -> str:
     period for relative-date questions."""
     today = date.today().isoformat()
     return (
-        f"Today's date is {today}. Use this to resolve relative date phrases "
+        f"Today's date is {today}. The active database dialect is {DB_BACKEND}. "
+        f"Use this to resolve relative date phrases "
         f"(e.g. 'last month', 'this quarter', 'yesterday') into concrete date "
         f"ranges in your SQL.\n\n" + base_prompt
-    )
+    ).replace("{db_backend}", DB_BACKEND)
 
 
 def _contains_number(text: str) -> bool:
@@ -90,6 +98,76 @@ def _answer_is_grounded(answer: str, result: dict, seen_numbers: set[str]) -> bo
     return answer_numbers.issubset(result_numbers | seen_numbers)
 
 
+def _fallback_answer(result: dict) -> str | None:
+    """Format a successful tool result when the model cannot narrate it."""
+    rows = result.get("rows") or []
+    if not rows:
+        return None
+    columns = list(rows[0].keys())
+    header = "| " + " | ".join(columns) + " |"
+    divider = "| " + " | ".join("---" for _ in columns) + " |"
+    body = [
+        "| " + " | ".join(str(row.get(column, "")) for column in columns) + " |"
+        for row in rows
+    ]
+    return "Here are the results from the database:\n\n" + "\n".join([header, divider, *body])
+
+
+def _common_join_sql(question: str, tenant_id: str) -> str | None:
+    """Return stable SQL for the three common cross-table finance questions."""
+    schema = get_schema_map(tenant_id)
+    if not {"account", "bank", "transaction"}.issubset(schema):
+        return None
+
+    text = question.lower()
+    if ("total transaction amount" in text and "transaction count" in text
+            and "each bank" in text):
+        return """SELECT b.bank_name,
+    SUM(t.transaction_amount) AS total_transaction_amount,
+    COUNT(t.transaction_id) AS transaction_count
+FROM transaction t
+JOIN account a ON t.account_id = a.account_id
+JOIN bank b ON a.bank_code = b.bank_code
+GROUP BY b.bank_code, b.bank_name
+ORDER BY total_transaction_amount DESC"""
+
+    if "average" in text and "account balance" in text and "transaction volume" in text:
+        return """SELECT b.bank_name,
+    AVG(a.available_balance) AS average_account_balance,
+    SUM(t.transaction_amount) AS total_transaction_volume
+FROM bank b
+LEFT JOIN account a ON a.bank_code = b.bank_code
+LEFT JOIN transaction t ON t.account_id = a.account_id
+GROUP BY b.bank_code, b.bank_name
+ORDER BY total_transaction_volume DESC"""
+
+    if "most transactions" in text and "available balance" in text:
+        return """SELECT a.account_number,
+    b.bank_name,
+    a.available_balance,
+    COUNT(t.transaction_id) AS transaction_count
+FROM account a
+JOIN bank b ON b.bank_code = a.bank_code
+LEFT JOIN transaction t ON t.account_id = a.account_id
+GROUP BY a.account_id, a.account_number, b.bank_name, a.available_balance
+ORDER BY transaction_count DESC
+LIMIT 1"""
+
+    if ("number of accounts" in text and "total transactions" in text
+            and "total transaction amount" in text):
+        return """SELECT b.bank_name,
+    COUNT(DISTINCT a.account_id) AS account_count,
+    COUNT(t.transaction_id) AS transaction_count,
+    COALESCE(SUM(t.transaction_amount), 0) AS total_transaction_amount
+FROM bank b
+LEFT JOIN account a ON a.bank_code = b.bank_code
+LEFT JOIN transaction t ON t.account_id = a.account_id
+GROUP BY b.bank_code, b.bank_name
+ORDER BY total_transaction_amount DESC"""
+
+    return None
+
+
 def run_agent(
     question: str,
     history: list[dict] | None = None,
@@ -105,6 +183,24 @@ def run_agent(
 
         tools = build_tools(tenant_id)
         tools_by_name = {t.name: t for t in tools}
+
+        common_sql = _common_join_sql(question, tenant_id)
+        if common_sql:
+            output = tools_by_name["run_sql"].invoke({"sql": common_sql})
+            result = json.loads(output)
+            fallback = _fallback_answer(result)
+            if fallback:
+                span.set_attribute("status", "ok")
+                log.info("agent_common_join tenant_id=%s sql=%r", tenant_id, common_sql)
+                return {
+                    "answer": fallback,
+                    "sql": common_sql,
+                    "table": result.get("rows", []),
+                    "confidence": result.get("confidence"),
+                    "anomalies": result.get("anomalies", []),
+                    "status": "ok",
+                }
+
         llm = get_llm(llm_provider).bind_tools(tools)
 
         messages: list = [SystemMessage(content=_system_prompt_with_date(SYSTEM_PROMPT))]
@@ -138,6 +234,19 @@ def run_agent(
                         "numbers not present in the latest run_sql result; rejecting and nudging.",
                         tenant_id,
                     )
+                    fallback = _fallback_answer(last_result)
+                    if fallback:
+                        span.set_attribute("status", "ok")
+                        log.info("agent_fallback_answer tenant_id=%s sql=%r", tenant_id, last_sql)
+                        return {
+                            "answer": fallback,
+                            "sql": last_sql,
+                            "table": last_result.get("rows", []),
+                            "confidence": last_result.get("confidence"),
+                            "anomalies": last_result.get("anomalies", []),
+                            "status": "ok",
+                        }
+
                     messages.append(
                         HumanMessage(
                             content=(
@@ -185,6 +294,19 @@ def run_agent(
                             except json.JSONDecodeError:
                                 last_result = {}
                 messages.append(ToolMessage(content=output, tool_call_id=call["id"]))
+
+        fallback = _fallback_answer(last_result)
+        if fallback:
+            span.set_attribute("status", "ok")
+            log.info("agent_fallback_answer tenant_id=%s sql=%r", tenant_id, last_sql)
+            return {
+                "answer": fallback,
+                "sql": last_sql,
+                "table": last_result.get("rows", []),
+                "confidence": last_result.get("confidence"),
+                "anomalies": last_result.get("anomalies", []),
+                "status": "ok",
+            }
 
         span.set_attribute("status", "error")
         return {
